@@ -6,6 +6,11 @@
 #include <string>
 #include <utility>
 #include <optional>
+#include <chrono>
+#include <fstream>
+#include <mutex>
+#include <thread>
+#include <atomic>
 
 #include "common/backend_api/object_storage/object_storage.h"
 #include "s3/client/client.h"
@@ -15,6 +20,84 @@
 #include "utils/logging/logging.h"
 #include "utils/env/env.h"
 #include "utils/fd/fd.h"
+
+namespace {
+
+struct TraceLog {
+    std::mutex mu;
+    std::ofstream file;
+    std::chrono::steady_clock::time_point epoch;
+    std::atomic<bool> conn_monitor_stop{false};
+    std::thread conn_thread;
+
+    TraceLog() : epoch(std::chrono::steady_clock::now()) {
+        const char* path = std::getenv("RUNAI_STREAMER_TRACE_FILE");
+        if (path) {
+            file.open(path, std::ios::out | std::ios::trunc);
+            if (file.is_open()) {
+                file << "event,timestamp_ms,object_key,offset,length,latency_ms,error\n";
+                conn_thread = std::thread(&TraceLog::monitor_connections, this);
+            }
+        }
+    }
+
+    ~TraceLog() {
+        conn_monitor_stop = true;
+        if (conn_thread.joinable()) conn_thread.join();
+    }
+
+    void monitor_connections() {
+        while (!conn_monitor_stop) {
+            int count = 0;
+            std::ifstream tcp("/proc/net/tcp");
+            std::ifstream tcp6("/proc/net/tcp6");
+            std::string line;
+            // Count established (state 01) connections to port 443 (01BB hex)
+            auto count_file = [&](std::ifstream& f) {
+                while (std::getline(f, line)) {
+                    // remote_address field is at fixed position, port is after ':'
+                    // Format: " sl  local_address rem_address   st ..."
+                    if (line.find(":01BB ") != std::string::npos ||
+                        line.find(":01BB ") != std::string::npos) {
+                        // Check state field (column 4, should be "01" for ESTABLISHED)
+                        auto st_pos = line.find(" 01 ", 20);
+                        if (st_pos != std::string::npos) count++;
+                    }
+                }
+            };
+            count_file(tcp);
+            count_file(tcp6);
+
+            auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - epoch).count();
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                if (file.is_open()) {
+                    file << "CONN," << ts << "," << count << "\n";
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
+    void log_get(const std::string& key, size_t offset, size_t length,
+                 std::chrono::steady_clock::time_point start, bool error) {
+        if (!file.is_open()) return;
+        auto now = std::chrono::steady_clock::now();
+        auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(now - epoch).count();
+        auto latency = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+        std::lock_guard<std::mutex> lock(mu);
+        file << "GET," << ts << "," << key << "," << offset << "," << length
+             << "," << latency << "," << (error ? 1 : 0) << "\n";
+    }
+
+    static TraceLog& instance() {
+        static TraceLog tl;
+        return tl;
+    }
+};
+
+} // anonymous namespace
 
 namespace runai::llm::streamer::impl::s3
 {
@@ -212,9 +295,19 @@ common::backend_api::ResponseCode_t S3Client::async_read(const char* path,
                 return stream.release();
             });
 
-        _client->GetObjectAsync(*request, [request, responder = _responder, request_id, counter, is_success](const Aws::S3Crt::S3CrtClient*, const Aws::S3Crt::Model::GetObjectRequest&,
+        auto trace_start = std::chrono::steady_clock::now();
+        auto trace_key = std::string(path_name.c_str());
+        auto trace_offset = offset_;
+        auto trace_length = bytesize_;
+
+        _client->GetObjectAsync(*request, [request, responder = _responder, request_id, counter, is_success,
+                                           trace_start, trace_key, trace_offset, trace_length](
+                                                                        const Aws::S3Crt::S3CrtClient*, const Aws::S3Crt::Model::GetObjectRequest&,
                                                                         const Aws::S3Crt::Model::GetObjectOutcome& outcome,
                                                                         const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) {
+            bool err = !outcome.IsSuccess();
+            TraceLog::instance().log_get(trace_key, trace_offset, trace_length, trace_start, err);
+
             if (outcome.IsSuccess())
             {
                 const auto running = counter->fetch_sub(1);
