@@ -263,82 +263,176 @@ common::backend_api::ResponseCode_t S3Client::async_read(const char* path,
     size_t size = std::max(1UL, range.length/_chunk_bytesize);
     LOG(SPAM) <<"Number of chunks is " << size;
 
-    // each range is divided into chunks (size is the number of chunks)
-    // when all the chunks have been read successfuly the response for that range is pushed to the responder
+    // Hedging: after hedge_after_ms, fire a duplicate for any incomplete chunk.
+    // First completion wins; second is ignored via per-chunk atomic bool.
+    static const unsigned long hedge_after_ms = utils::getenv<unsigned long>("RUNAI_STREAMER_HEDGE_AFTER_MS", 0);
 
     auto counter = std::make_shared< std::atomic<unsigned> >(size);
-    // success flag for the current range is passed to the client
     auto is_success = std::make_shared< std::atomic<bool> >(true);
+
+    // Per-chunk completion flags for hedging (true = already completed, ignore duplicate)
+    auto chunk_done = std::make_shared< std::vector<std::atomic<bool>> >(size);
+    for (unsigned i = 0; i < size; ++i) (*chunk_done)[i].store(false);
+
+    // Track chunk info for hedging
+    struct ChunkInfo { size_t offset; size_t length; char* buffer; };
+    auto chunks = std::make_shared<std::vector<ChunkInfo>>();
+    chunks->reserve(size);
 
     size_t total_ = range.length;
     size_t offset_ = range.offset;
     for (unsigned i = 0; i < size && !_stop; ++i)
     {
         size_t bytesize_ = (i == size - 1 ? total_ : _chunk_bytesize);
+        chunks->push_back({offset_, bytesize_, buffer_});
 
-        // send async request
-        auto request = std::make_shared<Aws::S3Crt::Model::GetObjectRequest>();
+        auto fire_request = [this, &bucket_name, &path_name, buffer_, bytesize_, offset_,
+                             responder = _responder, request_id, counter, is_success,
+                             chunk_done, i]() {
+            auto request = std::make_shared<Aws::S3Crt::Model::GetObjectRequest>();
+            request->SetBucket(bucket_name);
+            request->SetKey(path_name);
+            std::string range_str = "bytes=" + std::to_string(offset_) + "-" + std::to_string(offset_ + bytesize_ - 1);
+            request->SetRange(range_str.c_str());
 
-        request->SetBucket(bucket_name);
-        request->SetKey(path_name);
-        std::string range_str = "bytes=" + std::to_string(offset_) + "-" + std::to_string(offset_ + bytesize_ - 1);
-        request->SetRange(range_str.c_str());
+            request->SetResponseStreamFactory(
+                [buffer_, bytesize_]()
+                {
+                    std::unique_ptr<Aws::StringStream>
+                            stream(Aws::New<Aws::StringStream>("RunaiBuffer"));
+                    stream->rdbuf()->pubsetbuf(buffer_, bytesize_);
+                    return stream.release();
+                });
 
-        request->SetResponseStreamFactory(
-            [buffer_, bytesize_]()
-            {
-                std::unique_ptr<Aws::StringStream>
-                        stream(Aws::New<Aws::StringStream>("RunaiBuffer"));
+            auto trace_start = std::chrono::steady_clock::now();
+            auto trace_key = std::string(path_name.c_str());
+            auto trace_offset = offset_;
+            auto trace_length = bytesize_;
 
-                stream->rdbuf()->pubsetbuf(buffer_, bytesize_);
+            _client->GetObjectAsync(*request, [request, responder, request_id, counter, is_success,
+                                               chunk_done, i, trace_start, trace_key, trace_offset, trace_length](
+                                                                            const Aws::S3Crt::S3CrtClient*, const Aws::S3Crt::Model::GetObjectRequest&,
+                                                                            const Aws::S3Crt::Model::GetObjectOutcome& outcome,
+                                                                            const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) {
+                bool err = !outcome.IsSuccess();
+                TraceLog::instance().log_get(trace_key, trace_offset, trace_length, trace_start, err);
 
-                return stream.release();
+                // If this chunk already completed (from primary or hedge), ignore
+                bool expected = false;
+                if (!(*chunk_done)[i].compare_exchange_strong(expected, true))
+                {
+                    return; // duplicate completion, ignore
+                }
+
+                if (outcome.IsSuccess())
+                {
+                    const auto running = counter->fetch_sub(1);
+                    LOG(SPAM) << "Async read request " << request_id << " succeeded - " << running << " running";
+                    if (running == 1)
+                    {
+                        common::backend_api::Response r(request_id, common::ResponseCode::Success);
+                        responder->push(std::move(r));
+                    }
+                }
+                else
+                {
+                    bool previous = is_success->exchange(false);
+                    if (previous)
+                    {
+                        const auto & err = outcome.GetError();
+                        LOG(ERROR) << "Failed to download s3 object of request " << request_id << " " << err.GetExceptionName() << ": " << err.GetMessage();
+                        common::backend_api::Response r(request_id, common::ResponseCode::FileAccessError);
+                        responder->push(std::move(r));
+                    }
+                }
             });
+        };
 
-        auto trace_start = std::chrono::steady_clock::now();
-        auto trace_key = std::string(path_name.c_str());
-        auto trace_offset = offset_;
-        auto trace_length = bytesize_;
-
-        _client->GetObjectAsync(*request, [request, responder = _responder, request_id, counter, is_success,
-                                           trace_start, trace_key, trace_offset, trace_length](
-                                                                        const Aws::S3Crt::S3CrtClient*, const Aws::S3Crt::Model::GetObjectRequest&,
-                                                                        const Aws::S3Crt::Model::GetObjectOutcome& outcome,
-                                                                        const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) {
-            bool err = !outcome.IsSuccess();
-            TraceLog::instance().log_get(trace_key, trace_offset, trace_length, trace_start, err);
-
-            if (outcome.IsSuccess())
-            {
-                const auto running = counter->fetch_sub(1);
-                LOG(SPAM) << "Async read request " << request_id << " succeeded - " << running << " running";
-                // send success response only if all the requests have succeeded
-                // note that unsuccessful attempts do not update the counter
-                if (running == 1)
-                {
-                    common::backend_api::Response r(request_id, common::ResponseCode::Success);
-                    responder->push(std::move(r));
-                }
-            }
-            else
-            {
-                // Note: currently a failure to read any sub range fails the entire read request
-                //       a retry mechanism should be added for failed reads
-                bool previous = is_success->exchange(false);
-                // send error response only once
-                if (previous)
-                {
-                    const auto & err = outcome.GetError();
-                    LOG(ERROR) << "Failed to download s3 object of request " << request_id << " " << err.GetExceptionName() << ": " << err.GetMessage();
-                    common::backend_api::Response r(request_id, common::ResponseCode::FileAccessError);
-                    responder->push(std::move(r));
-                }
-            }
-        });
+        fire_request();
 
         total_ -= bytesize_;
         offset_ += bytesize_;
         buffer_ += bytesize_;
+    }
+
+    // Hedging: after threshold, fire duplicates for incomplete chunks
+    if (hedge_after_ms > 0 && !_stop)
+    {
+        auto hedge_chunks = chunks;
+        auto hedge_done = chunk_done;
+        auto hedge_size = size;
+        auto hedge_bucket = bucket_name;
+        auto hedge_path = path_name;
+        auto hedge_counter = counter;
+        auto hedge_success = is_success;
+        auto hedge_responder = _responder;
+        auto hedge_client = _client.get();
+        auto hedge_request_id = request_id;
+
+        std::thread([hedge_after_ms, hedge_chunks, hedge_done, hedge_size,
+                     hedge_bucket, hedge_path, hedge_counter, hedge_success,
+                     hedge_responder, hedge_client, hedge_request_id]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(hedge_after_ms));
+
+            for (unsigned i = 0; i < hedge_size; ++i)
+            {
+                if ((*hedge_done)[i].load()) continue; // already done
+
+                auto& ci = (*hedge_chunks)[i];
+                auto request = std::make_shared<Aws::S3Crt::Model::GetObjectRequest>();
+                request->SetBucket(hedge_bucket);
+                request->SetKey(hedge_path);
+                std::string range_str = "bytes=" + std::to_string(ci.offset) + "-" + std::to_string(ci.offset + ci.length - 1);
+                request->SetRange(range_str.c_str());
+
+                request->SetResponseStreamFactory(
+                    [buf = ci.buffer, len = ci.length]()
+                    {
+                        std::unique_ptr<Aws::StringStream>
+                                stream(Aws::New<Aws::StringStream>("RunaiBuffer"));
+                        stream->rdbuf()->pubsetbuf(buf, len);
+                        return stream.release();
+                    });
+
+                auto trace_start = std::chrono::steady_clock::now();
+                auto trace_key = std::string(hedge_path.c_str());
+
+                hedge_client->GetObjectAsync(*request, [request, hedge_responder, hedge_request_id,
+                                                        hedge_counter, hedge_success, hedge_done, i,
+                                                        trace_start, trace_key, ci](
+                                                                            const Aws::S3Crt::S3CrtClient*, const Aws::S3Crt::Model::GetObjectRequest&,
+                                                                            const Aws::S3Crt::Model::GetObjectOutcome& outcome,
+                                                                            const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) {
+                    bool err = !outcome.IsSuccess();
+                    TraceLog::instance().log_get(trace_key, ci.offset, ci.length, trace_start, err);
+
+                    bool expected = false;
+                    if (!(*hedge_done)[i].compare_exchange_strong(expected, true))
+                    {
+                        return; // primary already completed
+                    }
+
+                    if (outcome.IsSuccess())
+                    {
+                        const auto running = hedge_counter->fetch_sub(1);
+                        if (running == 1)
+                        {
+                            common::backend_api::Response r(hedge_request_id, common::ResponseCode::Success);
+                            hedge_responder->push(std::move(r));
+                        }
+                    }
+                    else
+                    {
+                        bool previous = hedge_success->exchange(false);
+                        if (previous)
+                        {
+                            common::backend_api::Response r(hedge_request_id, common::ResponseCode::FileAccessError);
+                            hedge_responder->push(std::move(r));
+                        }
+                    }
+                });
+            }
+        }).detach();
     }
 
     return _stop ? common::ResponseCode::FinishedError : common::ResponseCode::Success;
