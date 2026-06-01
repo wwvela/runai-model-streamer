@@ -36,6 +36,15 @@ ClientConfiguration::ClientConfiguration()
         LOG(DEBUG) << "S3 minimum speed is set to " << low_speed_limit << " bytes in second";
         config.lowSpeedLimit = low_speed_limit;
     }
+
+    // CRT internal part size for auto-ranged-get (default 8 MiB)
+    // Larger values reduce request count and per-request overhead
+    const auto part_size = utils::getenv<unsigned long>("RUNAI_STREAMER_S3_PART_SIZE", 0);
+    if (part_size)
+    {
+        LOG(DEBUG) << "S3 part size is set to " << part_size << " bytes";
+        config.partSize = part_size;
+    }
 }
 
 }; // namespace runai::llm::streamer::impl::s3
