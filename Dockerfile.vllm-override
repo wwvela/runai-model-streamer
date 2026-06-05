@@ -1,0 +1,34 @@
+FROM 082097083972.dkr.ecr.us-east-2.amazonaws.com/vllm/vllm-openai:nightly
+
+# Replace runai-model-streamer .so files with custom-built versions (GPUDirect support)
+
+# Find the package directory without importing (avoids loading the .so which may be missing)
+RUN SITE=$(python3 -c "import importlib.util; spec = importlib.util.find_spec('runai_model_streamer'); print(spec.submodule_search_locations[0])") && \
+    echo "$SITE" > /tmp/runai_site_path.txt && \
+    ls "$SITE/libstreamer/lib/" 2>/dev/null || mkdir -p "$SITE/libstreamer/lib/"
+
+# Copy all .so files
+COPY cpp/libstreamer.so /tmp/libstreamer.so
+COPY cpp/libstreamers3.so /tmp/libstreamers3.so
+COPY cpp/libstreamergcs.so /tmp/libstreamergcs.so
+COPY cpp/libstreamerazure.so /tmp/libstreamerazure.so
+
+# Replace .so files
+RUN SITE=$(cat /tmp/runai_site_path.txt) && \
+    cp /tmp/libstreamer.so "$SITE/libstreamer/lib/libstreamer.so" && \
+    cp /tmp/libstreamers3.so "$SITE/libstreamer/lib/libstreamers3.so" && \
+    cp /tmp/libstreamergcs.so "$SITE/libstreamer/lib/libstreamergcs.so" && \
+    cp /tmp/libstreamerazure.so "$SITE/libstreamer/lib/libstreamerazure.so"
+
+# Replace the Python package files to match the new ABI
+COPY py/runai_model_streamer/runai_model_streamer/ /tmp/runai_model_streamer_py/
+RUN SITE=$(cat /tmp/runai_site_path.txt) && \
+    cp /tmp/runai_model_streamer_py/libstreamer/__init__.py "$SITE/libstreamer/__init__.py" && \
+    cp /tmp/runai_model_streamer_py/libstreamer/libstreamer.py "$SITE/libstreamer/libstreamer.py" && \
+    cp /tmp/runai_model_streamer_py/file_streamer/*.py "$SITE/file_streamer/" && \
+    cp /tmp/runai_model_streamer_py/safetensors_streamer/*.py "$SITE/safetensors_streamer/" && \
+    cp /tmp/runai_model_streamer_py/distributed_streamer/distributed_streamer.py "$SITE/distributed_streamer/distributed_streamer.py"
+
+# Add smoke test script and run CPU-only verification at build time
+COPY smoke_test.py /opt/smoke_test.py
+RUN python3 /opt/smoke_test.py

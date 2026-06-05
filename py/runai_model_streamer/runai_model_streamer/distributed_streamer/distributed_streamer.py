@@ -473,13 +473,27 @@ class _distributedStreamer:
         )
 
     def _use_cuda_direct(self) -> bool:
-        return (
+        if not (
             self._device_str is not None
             and self._device_str.startswith("cuda")
             and torch.version.hip is None
             and torch.cuda.is_available()
             and self._all_paths_local()
-        )
+        ):
+            return False
+
+        alignment = get_cuda_alignment()
+        extra = alignment - 1 if alignment > 1 else 0
+        max_chunk = max(self.max_chunk, 1)
+        required = max_chunk + extra
+        free_memory, _ = torch.cuda.mem_get_info(self._device_str)
+        if free_memory < required * 2:
+            logger.info(
+                f"[RunAI Streamer][Distributed] Not enough free GPU memory for CUDA direct path "
+                f"(need {required * 2} bytes, have {free_memory} bytes) — falling back to CPU"
+            )
+            return False
+        return True
 
     def _get_chunks_cuda(self) -> Iterator:
         alignment = get_cuda_alignment()

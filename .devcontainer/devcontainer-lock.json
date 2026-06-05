@@ -1,0 +1,14 @@
+{
+  "features": {
+    "ghcr.io/devcontainers-community/features/bazel:1": {
+      "version": "1.2.2",
+      "resolved": "ghcr.io/devcontainers-community/features/bazel@sha256:587cd6cdd290cfb98c9ba8605a8a27f24fc1e9c736cdd03da099385863386331",
+      "integrity": "sha256:587cd6cdd290cfb98c9ba8605a8a27f24fc1e9c736cdd03da099385863386331"
+    },
+    "ghcr.io/rocker-org/devcontainer-features/apt-packages:1": {
+      "version": "1.0.2",
+      "resolved": "ghcr.io/rocker-org/devcontainer-features/apt-packages@sha256:87a4d7750a596a5db034ba8508782f31aebdc2ffe955c66aaecb33d9de2ecdae",
+      "integrity": "sha256:87a4d7750a596a5db034ba8508782f31aebdc2ffe955c66aaecb33d9de2ecdae"
+    }
+  }
+}
