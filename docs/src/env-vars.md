@@ -196,6 +196,20 @@ String `0` or `1`
 
 `0`
 
+### RUNAI_STREAMER_CACHE_DIR
+
+Specifies a local directory to cache model files downloaded from object storage (S3, GCS, Azure). When set, files streamed from object storage are downloaded to this directory in the background after streaming completes. On subsequent loads, cached files are served from the local filesystem, enabling the faster NVMe → pinned DRAM → GPU path instead of re-downloading from object storage.
+
+Cache entries are validated by a `.done` sentinel file. Partial downloads are written atomically (temp file + rename) to prevent corruption. The cache is only used when ALL files in a streaming request have cache hits; partial cache hits fall back to streaming from object storage while scheduling background downloads for the missing files.
+
+#### Values accepted
+
+String (path to a directory)
+
+#### Default value
+
+Unset — caching is disabled
+
 ### RUNAI_STREAMER_GCS_USE_GRPC
 
 Enables the gRPC transport for the GCS client, which utilizes direct connectivity for higher throughput and lower latency when running within Google Cloud.

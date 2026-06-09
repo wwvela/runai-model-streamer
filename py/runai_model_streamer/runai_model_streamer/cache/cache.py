@@ -1,0 +1,190 @@
+import hashlib
+import json
+import os
+import logging
+import threading
+import time
+from typing import Dict, List, Optional, Tuple
+
+from runai_model_streamer.s3_utils.s3_utils import (
+    S3Credentials,
+    is_s3_path,
+    is_gs_path,
+    is_azure_path,
+)
+
+logger = logging.getLogger(__name__)
+
+RUNAI_STREAMER_CACHE_DIR_ENV = "RUNAI_STREAMER_CACHE_DIR"
+
+
+def _is_object_storage_path(path: str) -> bool:
+    return is_s3_path(path) or is_gs_path(path) or is_azure_path(path)
+
+
+def _cache_key(remote_path: str) -> str:
+    """Deterministic cache filename from a remote URI."""
+    h = hashlib.sha256(remote_path.encode()).hexdigest()[:16]
+    basename = os.path.basename(remote_path.rstrip("/"))
+    return f"{basename}.{h}"
+
+
+class _CacheWriter:
+    """Incrementally writes streamed data to a cache file."""
+
+    def __init__(self, cache_dir: str, remote_path: str, file_offset: int) -> None:
+        self._remote_path = remote_path
+        self._file_offset = file_offset
+        key = _cache_key(remote_path)
+        self._final_path = os.path.join(cache_dir, key)
+        self._sentinel = self._final_path + ".done"
+        self._tmp_path = self._final_path + f".partial.{os.getpid()}"
+        self._fd = os.open(self._tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        self._written = 0
+        self._start_time = time.time()
+
+    def append(self, data: bytes) -> None:
+        os.write(self._fd, data)
+        self._written += len(data)
+
+    def finalize(self) -> None:
+        try:
+            os.fsync(self._fd)
+            os.close(self._fd)
+            self._fd = -1
+            # Another worker may have already written the final file
+            if os.path.exists(self._final_path):
+                logger.debug(f"[RunAI Streamer][Cache] Already cached by another worker: {self._remote_path}")
+                self._cleanup()
+                return
+            os.rename(self._tmp_path, self._final_path)
+            # Sentinel stores metadata for cache validation
+            meta = {"remote_path": self._remote_path, "file_offset": self._file_offset, "size": self._written}
+            with open(self._sentinel, "w") as f:
+                json.dump(meta, f)
+            elapsed = time.time() - self._start_time
+            throughput = self._written / elapsed / (1024 * 1024) if elapsed > 0 else 0
+            logger.debug(
+                f"[RunAI Streamer][Cache] Cached: {self._remote_path} "
+                f"({self._written} bytes) in {elapsed:.1f}s ({throughput:.0f} MB/s)"
+            )
+        except OSError as e:
+            # Race with another worker — if final file now exists, that's fine
+            if os.path.exists(self._final_path):
+                logger.debug(f"[RunAI Streamer][Cache] Already cached by another worker: {self._remote_path}")
+            else:
+                logger.error(f"[RunAI Streamer][Cache] Finalize failed for {self._remote_path}: {e}")
+            self._cleanup()
+
+    def abort(self) -> None:
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        if self._fd >= 0:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = -1
+        try:
+            os.unlink(self._tmp_path)
+        except OSError:
+            pass
+
+
+class StreamCache:
+    """Write-through cache for object storage files.
+
+    Writes streamed tensor data to local cache incrementally as batches complete.
+    On subsequent loads, serves from local filesystem with offset=0 (the cached
+    file contains only the tensor data, starting from the original file_offset).
+    """
+
+    def __init__(self, cache_dir: Optional[str] = None) -> None:
+        self._cache_dir = cache_dir or os.getenv(RUNAI_STREAMER_CACHE_DIR_ENV)
+        self._writers: Dict[str, _CacheWriter] = {}
+        self._cache_start_time: Optional[float] = None
+
+        if self._cache_dir:
+            os.makedirs(self._cache_dir, exist_ok=True)
+            logger.debug(f"[RunAI Streamer][Cache] Cache enabled, directory: {self._cache_dir}")
+        else:
+            logger.debug("[RunAI Streamer][Cache] Cache disabled (RUNAI_STREAMER_CACHE_DIR not set)")
+
+    @property
+    def enabled(self) -> bool:
+        return self._cache_dir is not None
+
+    def cached_path_and_offset(self, remote_path: str) -> Optional[Tuple[str, int]]:
+        """Return (local_path, adjusted_offset) if cached, else None.
+
+        The cached file stores tensor data starting from the original file_offset,
+        so the adjusted offset is always 0.
+        """
+        if not self.enabled:
+            return None
+        if not _is_object_storage_path(remote_path):
+            return None
+
+        key = _cache_key(remote_path)
+        local_path = os.path.join(self._cache_dir, key)
+        sentinel = local_path + ".done"
+
+        data_exists = os.path.exists(local_path)
+        sentinel_exists = os.path.exists(sentinel)
+
+        if data_exists and sentinel_exists:
+            file_size = os.path.getsize(local_path)
+            logger.debug(f"[RunAI Streamer][Cache] HIT: {remote_path} -> {local_path} ({file_size} bytes)")
+            return local_path, 0
+
+        if data_exists and not sentinel_exists:
+            logger.debug(f"[RunAI Streamer][Cache] INCOMPLETE: {local_path} exists but .done sentinel missing (partial download?)")
+        else:
+            logger.debug(f"[RunAI Streamer][Cache] MISS: {remote_path} (not in cache)")
+
+        return None
+
+    def open_writer(self, remote_path: str, file_offset: int, total_bytes: int) -> None:
+        """Open a cache writer for a file being streamed from object storage.
+
+        Called once per file when streaming starts for a cache miss.
+        """
+        if not self.enabled:
+            return
+        if not _is_object_storage_path(remote_path):
+            return
+        if self.cached_path_and_offset(remote_path) is not None:
+            return
+        if remote_path in self._writers:
+            return
+
+        if self._cache_start_time is None:
+            self._cache_start_time = time.time()
+
+        logger.debug(f"[RunAI Streamer][Cache] Opening cache writer for: {remote_path} ({total_bytes} bytes)")
+        self._writers[remote_path] = _CacheWriter(self._cache_dir, remote_path, file_offset)
+
+    def append_data(self, remote_path: str, data: bytes) -> None:
+        """Append streamed data to the cache file."""
+        writer = self._writers.get(remote_path)
+        if writer is None:
+            return
+        writer.append(data)
+
+    def finalize(self, remote_path: str) -> None:
+        """Finalize a cache file after all data has been written."""
+        writer = self._writers.pop(remote_path, None)
+        if writer is None:
+            return
+        writer.finalize()
+        if not self._writers:
+            elapsed = time.time() - self._cache_start_time if self._cache_start_time else 0
+            logger.debug(f"[RunAI Streamer][Cache] All files cached in {elapsed:.1f}s")
+            self._cache_start_time = None
+
+    def abort_all(self) -> None:
+        """Clean up incomplete writers on error."""
+        for writer in self._writers.values():
+            writer.abort()
+        self._writers.clear()
