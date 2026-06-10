@@ -43,7 +43,8 @@ class _CacheWriter:
         self._written = 0
         self._start_time = time.time()
 
-    def append(self, data: bytes) -> None:
+    def append(self, data) -> None:
+        """Append data to the cache file. Accepts bytes, memoryview, or numpy array."""
         os.write(self._fd, data)
         self._written += len(data)
 
@@ -54,7 +55,7 @@ class _CacheWriter:
             self._fd = -1
             # Another worker may have already written the final file
             if os.path.exists(self._final_path):
-                logger.debug(f"[RunAI Streamer][Cache] Already cached by another worker: {self._remote_path}")
+                logger.info(f"[RunAI Streamer][Cache] Already cached by another worker: {self._remote_path}")
                 self._cleanup()
                 return
             os.rename(self._tmp_path, self._final_path)
@@ -64,14 +65,14 @@ class _CacheWriter:
                 json.dump(meta, f)
             elapsed = time.time() - self._start_time
             throughput = self._written / elapsed / (1024 * 1024) if elapsed > 0 else 0
-            logger.debug(
+            logger.info(
                 f"[RunAI Streamer][Cache] Cached: {self._remote_path} "
                 f"({self._written} bytes) in {elapsed:.1f}s ({throughput:.0f} MB/s)"
             )
         except OSError as e:
             # Race with another worker — if final file now exists, that's fine
             if os.path.exists(self._final_path):
-                logger.debug(f"[RunAI Streamer][Cache] Already cached by another worker: {self._remote_path}")
+                logger.info(f"[RunAI Streamer][Cache] Already cached by another worker: {self._remote_path}")
             else:
                 logger.error(f"[RunAI Streamer][Cache] Finalize failed for {self._remote_path}: {e}")
             self._cleanup()
@@ -107,9 +108,9 @@ class StreamCache:
 
         if self._cache_dir:
             os.makedirs(self._cache_dir, exist_ok=True)
-            logger.debug(f"[RunAI Streamer][Cache] Cache enabled, directory: {self._cache_dir}")
+            logger.info(f"[RunAI Streamer][Cache] Cache enabled, directory: {self._cache_dir}")
         else:
-            logger.debug("[RunAI Streamer][Cache] Cache disabled (RUNAI_STREAMER_CACHE_DIR not set)")
+            logger.info("[RunAI Streamer][Cache] Cache disabled (RUNAI_STREAMER_CACHE_DIR not set)")
 
     @property
     def enabled(self) -> bool:
@@ -135,13 +136,13 @@ class StreamCache:
 
         if data_exists and sentinel_exists:
             file_size = os.path.getsize(local_path)
-            logger.debug(f"[RunAI Streamer][Cache] HIT: {remote_path} -> {local_path} ({file_size} bytes)")
+            logger.info(f"[RunAI Streamer][Cache] HIT: {remote_path} -> {local_path} ({file_size} bytes)")
             return local_path, 0
 
         if data_exists and not sentinel_exists:
-            logger.debug(f"[RunAI Streamer][Cache] INCOMPLETE: {local_path} exists but .done sentinel missing (partial download?)")
+            logger.info(f"[RunAI Streamer][Cache] INCOMPLETE: {local_path} exists but .done sentinel missing (partial download?)")
         else:
-            logger.debug(f"[RunAI Streamer][Cache] MISS: {remote_path} (not in cache)")
+            logger.info(f"[RunAI Streamer][Cache] MISS: {remote_path} (not in cache)")
 
         return None
 
@@ -162,7 +163,7 @@ class StreamCache:
         if self._cache_start_time is None:
             self._cache_start_time = time.time()
 
-        logger.debug(f"[RunAI Streamer][Cache] Opening cache writer for: {remote_path} ({total_bytes} bytes)")
+        logger.info(f"[RunAI Streamer][Cache] Opening cache writer for: {remote_path} ({total_bytes} bytes)")
         self._writers[remote_path] = _CacheWriter(self._cache_dir, remote_path, file_offset)
 
     def append_data(self, remote_path: str, data: bytes) -> None:
@@ -180,7 +181,7 @@ class StreamCache:
         writer.finalize()
         if not self._writers:
             elapsed = time.time() - self._cache_start_time if self._cache_start_time else 0
-            logger.debug(f"[RunAI Streamer][Cache] All files cached in {elapsed:.1f}s")
+            logger.info(f"[RunAI Streamer][Cache] All files cached in {elapsed:.1f}s")
             self._cache_start_time = None
 
     def abort_all(self) -> None:
