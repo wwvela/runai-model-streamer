@@ -133,9 +133,9 @@ class FileStreamer:
         if use_cache:
             num_files = len(self._cache_original_paths)
             if all_cached:
-                logger.debug(f"[RunAI Streamer][Cache] ALL {num_files} file(s) found in cache — using local paths (fast path)")
+                logger.info(f"[RunAI Streamer][Cache] ALL {num_files} file(s) found in cache — using local paths (fast path)")
             else:
-                logger.debug(f"[RunAI Streamer][Cache] Cache miss for some files — streaming all {num_files} file(s) from remote")
+                logger.info(f"[RunAI Streamer][Cache] Cache miss for some files — streaming all {num_files} file(s) from remote")
 
         for i, file_stream_request in enumerate(file_stream_requests):
             if all_cached:
@@ -260,10 +260,12 @@ class FileStreamer:
             if size == 0:
                 continue
 
+            # Pass buffer directly to os.write — numpy arrays and memoryviews
+            # support the buffer protocol, avoiding an extra copy to bytes.
             if isinstance(buf, torch.Tensor):
-                data = buf[:size].cpu().numpy().tobytes()
+                data = buf[:size].cpu().numpy()
             else:
-                data = bytes(buf[:size])
+                data = memoryview(buf)[:size]
 
             self._cache.append_data(original_path, data)
             self._cache_written_bytes[file_request.id] = self._cache_written_bytes.get(file_request.id, 0) + size
