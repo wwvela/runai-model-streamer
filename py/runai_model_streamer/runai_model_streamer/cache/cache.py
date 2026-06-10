@@ -22,20 +22,24 @@ def _is_object_storage_path(path: str) -> bool:
     return is_s3_path(path) or is_gs_path(path) or is_azure_path(path)
 
 
-def _cache_key(remote_path: str) -> str:
-    """Deterministic cache filename from a remote URI."""
+def _cache_key(remote_path: str, rank: int = 0, world_size: int = 1) -> str:
+    """Deterministic cache filename from a remote URI and TP config."""
     h = hashlib.sha256(remote_path.encode()).hexdigest()[:16]
     basename = os.path.basename(remote_path.rstrip("/"))
+    if world_size > 1:
+        return f"{basename}.tp{world_size}_rank{rank}.{h}"
     return f"{basename}.{h}"
 
 
 class _CacheWriter:
     """Incrementally writes streamed data to a cache file."""
 
-    def __init__(self, cache_dir: str, remote_path: str, file_offset: int) -> None:
+    def __init__(self, cache_dir: str, remote_path: str, file_offset: int, rank: int = 0, world_size: int = 1) -> None:
         self._remote_path = remote_path
         self._file_offset = file_offset
-        key = _cache_key(remote_path)
+        self._rank = rank
+        self._world_size = world_size
+        key = _cache_key(remote_path, rank, world_size)
         self._final_path = os.path.join(cache_dir, key)
         self._sentinel = self._final_path + ".done"
         self._tmp_path = self._final_path + f".partial.{os.getpid()}"
@@ -60,7 +64,7 @@ class _CacheWriter:
                 return
             os.rename(self._tmp_path, self._final_path)
             # Sentinel stores metadata for cache validation
-            meta = {"remote_path": self._remote_path, "file_offset": self._file_offset, "size": self._written}
+            meta = {"remote_path": self._remote_path, "file_offset": self._file_offset, "size": self._written, "rank": self._rank, "world_size": self._world_size}
             with open(self._sentinel, "w") as f:
                 json.dump(meta, f)
             elapsed = time.time() - self._start_time
@@ -105,12 +109,20 @@ class StreamCache:
         self._cache_dir = cache_dir or os.getenv(RUNAI_STREAMER_CACHE_DIR_ENV)
         self._writers: Dict[str, _CacheWriter] = {}
         self._cache_start_time: Optional[float] = None
+        self._rank: int = 0
+        self._world_size: int = 1
 
         if self._cache_dir:
             os.makedirs(self._cache_dir, exist_ok=True)
             logger.info(f"[RunAI Streamer][Cache] Cache enabled, directory: {self._cache_dir}")
         else:
             logger.info("[RunAI Streamer][Cache] Cache disabled (RUNAI_STREAMER_CACHE_DIR not set)")
+
+    def set_distributed(self, rank: int, world_size: int) -> None:
+        """Set the distributed rank and world size for cache key generation."""
+        self._rank = rank
+        self._world_size = world_size
+        logger.info(f"[RunAI Streamer][Cache] Distributed config: rank={rank}, world_size={world_size}")
 
     @property
     def enabled(self) -> bool:
@@ -120,14 +132,15 @@ class StreamCache:
         """Return (local_path, adjusted_offset) if cached, else None.
 
         The cached file stores tensor data starting from the original file_offset,
-        so the adjusted offset is always 0.
+        so the adjusted offset is always 0. Validates that the cached entry matches
+        the current TP configuration.
         """
         if not self.enabled:
             return None
         if not _is_object_storage_path(remote_path):
             return None
 
-        key = _cache_key(remote_path)
+        key = _cache_key(remote_path, self._rank, self._world_size)
         local_path = os.path.join(self._cache_dir, key)
         sentinel = local_path + ".done"
 
@@ -135,6 +148,22 @@ class StreamCache:
         sentinel_exists = os.path.exists(sentinel)
 
         if data_exists and sentinel_exists:
+            # Validate sentinel metadata matches current TP config
+            try:
+                with open(sentinel, "r") as f:
+                    meta = json.loads(f.read())
+                cached_world_size = meta.get("world_size", 1)
+                cached_rank = meta.get("rank", 0)
+                if cached_world_size != self._world_size or cached_rank != self._rank:
+                    logger.info(
+                        f"[RunAI Streamer][Cache] STALE: {remote_path} cached with "
+                        f"tp{cached_world_size}_rank{cached_rank} but current is "
+                        f"tp{self._world_size}_rank{self._rank} — skipping"
+                    )
+                    return None
+            except (json.JSONDecodeError, OSError):
+                pass  # Old-format sentinel, trust the key-based matching
+
             file_size = os.path.getsize(local_path)
             logger.info(f"[RunAI Streamer][Cache] HIT: {remote_path} -> {local_path} ({file_size} bytes)")
             return local_path, 0
@@ -163,8 +192,8 @@ class StreamCache:
         if self._cache_start_time is None:
             self._cache_start_time = time.time()
 
-        logger.info(f"[RunAI Streamer][Cache] Opening cache writer for: {remote_path} ({total_bytes} bytes)")
-        self._writers[remote_path] = _CacheWriter(self._cache_dir, remote_path, file_offset)
+        logger.info(f"[RunAI Streamer][Cache] Opening cache writer for: {remote_path} ({total_bytes} bytes, rank={self._rank}, tp={self._world_size})")
+        self._writers[remote_path] = _CacheWriter(self._cache_dir, remote_path, file_offset, self._rank, self._world_size)
 
     def append_data(self, remote_path: str, data: bytes) -> None:
         """Append streamed data to the cache file."""

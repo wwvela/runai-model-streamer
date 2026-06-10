@@ -368,10 +368,32 @@ class _distributedStreamer:
             logger.debug(f"[RunAI Streamer][Distributed] Rank {self.original_group_rank}: No chunks to read from storage")
             return
 
+        # Set distributed config on cache so each rank caches its own partition
+        self.file_streamer._cache.set_distributed(self.rank, self.group_size)
+
         # read files
         # For NVIDIA CUDA with local filesystem, stream directly to GPU via read_cuda
         # (cuMemcpyHtoDAsync). Otherwise fall back to CPU.
-        read_device = device if self._use_cuda_direct() else "cpu"
+        # When cache is enabled and all files are cached locally, paths will become
+        # local after substitution — treat as local for device selection.
+        all_cached_locally = False
+        if (enable_cache and self.file_streamer._cache.enabled
+                and self._device_str and self._device_str.startswith("cuda")
+                and torch.version.hip is None and torch.cuda.is_available()):
+            unique_paths = list(dict.fromkeys(fc.path for fc in self.rank_file_chunks_list))
+            all_cached_locally = all(
+                self.file_streamer._cache.cached_path_and_offset(p) is not None
+                for p in unique_paths
+            )
+        self._all_cached_locally = all_cached_locally
+        read_device = device if (self._use_cuda_direct() or all_cached_locally) else "cpu"
+        if self.original_group_rank == 0:
+            logger.info(
+                f"[RunAI Streamer][Cache] read_device={read_device}, "
+                f"_use_cuda_direct={self._use_cuda_direct()}, "
+                f"all_cached_locally={all_cached_locally}, "
+                f"_all_paths_local={self._all_paths_local()}"
+            )
         original_memory_limit = os.environ.get("RUNAI_STREAMER_MEMORY_LIMIT")
         try:
             # Change default memory limit to unlimited so the file_streamer reads as
@@ -395,7 +417,7 @@ class _distributedStreamer:
         if not self.file_streamer:
             raise ValueError("Streamer not initialized")
 
-        if self._use_cuda_direct():
+        if self._use_cuda_direct() or getattr(self, '_all_cached_locally', False):
             yield from self._get_chunks_cuda()
             return
 

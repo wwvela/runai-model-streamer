@@ -119,15 +119,18 @@ class FileStreamer:
             self.total_size += sum(file_stream_request.chunks)
             self._cache_original_paths.append(file_stream_request.path)
             self._cache_file_offsets.append(file_stream_request.offset)
-            self._cache_expected_bytes[file_stream_request.id] = sum(file_stream_request.chunks)
-            self._cache_written_bytes[file_stream_request.id] = 0
+            path = file_stream_request.path
+            self._cache_expected_bytes[path] = self._cache_expected_bytes.get(path, 0) + sum(file_stream_request.chunks)
+            if path not in self._cache_written_bytes:
+                self._cache_written_bytes[path] = 0
 
-        # Check cache: only use cached paths if ALL files hit cache (the C++ layer
+        # Check cache: only use cached paths if ALL unique files hit cache (the C++ layer
         # does not support mixed local/remote paths in a single request).
         use_cache = enable_cache and self._cache.enabled
+        unique_paths = list(dict.fromkeys(self._cache_original_paths))
         all_cached = use_cache and all(
             self._cache.cached_path_and_offset(p) is not None
-            for p in self._cache_original_paths
+            for p in unique_paths
         )
 
         if use_cache:
@@ -137,11 +140,16 @@ class FileStreamer:
             else:
                 logger.info(f"[RunAI Streamer][Cache] Cache miss for some files — streaming all {num_files} file(s) from remote")
 
+        # Track cumulative offset per file path for cache hit offset calculation
+        cache_offset_tracker = {}
         for i, file_stream_request in enumerate(file_stream_requests):
             if all_cached:
-                cached_path, cached_offset = self._cache.cached_path_and_offset(self._cache_original_paths[i])
+                original = self._cache_original_paths[i]
+                cached_path, _ = self._cache.cached_path_and_offset(original)
                 file_stream_request.path = cached_path
-                file_stream_request.offset = cached_offset
+                # Set offset to cumulative position within the cached file
+                file_stream_request.offset = cache_offset_tracker.get(original, 0)
+                cache_offset_tracker[original] = cache_offset_tracker.get(original, 0) + sum(file_stream_request.chunks)
             else:
                 file_stream_request.path = self.handle_object_store(file_stream_request.path, credentials)
                 if use_cache:
@@ -182,6 +190,11 @@ class FileStreamer:
             yield from self._get_chunks_cuda()
         else:
             yield from self._get_chunks_cpu()
+
+        # Finalize all cache writers after all chunks have been streamed
+        if self._cache.enabled:
+            for path in list(self._cache._writers.keys()):
+                self._cache.finalize(path)
 
     def _get_chunks_cuda(self) -> Iterator:
         """Yield CUDA tensor slices as each response arrives, then fire the next batch.
@@ -246,14 +259,12 @@ class FileStreamer:
             )
 
     def _cache_current_batch(self) -> None:
-        """Write batch data to cache and finalize files that are complete."""
+        """Write batch data to cache, finalize files as they complete."""
         if not self._cache.enabled or not self._cache._writers or self.active_request is None:
             return
 
         for i, file_request in enumerate(self.active_request.files):
-            if file_request.id >= len(self._cache_original_paths):
-                continue
-            original_path = self._cache_original_paths[file_request.id]
+            original_path = file_request.path
 
             buf = self.requests_iterator.file_buffers[i]
             size = sum(file_request.chunks)
@@ -268,8 +279,8 @@ class FileStreamer:
                 data = memoryview(buf)[:size]
 
             self._cache.append_data(original_path, data)
-            self._cache_written_bytes[file_request.id] = self._cache_written_bytes.get(file_request.id, 0) + size
+            self._cache_written_bytes[original_path] = self._cache_written_bytes.get(original_path, 0) + size
 
-            # Finalize when all bytes for this file have been written
-            if self._cache_written_bytes[file_request.id] >= self._cache_expected_bytes.get(file_request.id, 0):
+            # Finalize as soon as all bytes for this file are written
+            if self._cache_written_bytes[original_path] >= self._cache_expected_bytes.get(original_path, 0):
                 self._cache.finalize(original_path)
