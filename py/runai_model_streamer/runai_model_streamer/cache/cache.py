@@ -54,7 +54,6 @@ class _CacheWriter:
 
     def finalize(self) -> None:
         try:
-            os.fsync(self._fd)
             os.close(self._fd)
             self._fd = -1
             # Another worker may have already written the final file
@@ -184,9 +183,9 @@ class StreamCache:
             return
         if not _is_object_storage_path(remote_path):
             return
-        if self.cached_path_and_offset(remote_path) is not None:
-            return
         if remote_path in self._writers:
+            return
+        if self.cached_path_and_offset(remote_path) is not None:
             return
 
         if self._cache_start_time is None:
