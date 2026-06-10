@@ -191,7 +191,7 @@ class FileStreamer:
         else:
             yield from self._get_chunks_cpu()
 
-        # Finalize all cache writers after all chunks have been streamed
+        # Finalize all remaining cache writers after streaming completes.
         if self._cache.enabled:
             for path in list(self._cache._writers.keys()):
                 self._cache.finalize(path)
@@ -205,7 +205,12 @@ class FileStreamer:
         """
         while self.active_request is not None:
             for _ in range(sum(len(f.chunks) for f in self.active_request.files)):
-                file_relative_index, chunk_relative_index = runai_response(self.streamer)
+                try:
+                    file_relative_index, chunk_relative_index = runai_response(self.streamer)
+                except ValueError as e:
+                    current_files = [(f.path, f.offset, sum(f.chunks)) for f in self.active_request.files]
+                    logger.error(f"[RunAI Streamer][Cache] Read error. Current batch files: {current_files}")
+                    raise
                 if chunk_relative_index is None:
                     return
                 file_path, chunk_index, chunk_tensor = self.requests_iterator.get_global_file_and_chunk(
@@ -233,7 +238,12 @@ class FileStreamer:
         """Yield CPU tensors as each response arrives, then fire the next batch."""
         while True:
             for _ in range(sum(len(f.chunks) for f in self.active_request.files)):
-                file_relative_index, chunk_relative_index = runai_response(self.streamer)
+                try:
+                    file_relative_index, chunk_relative_index = runai_response(self.streamer)
+                except ValueError as e:
+                    current_files = [(f.path, f.offset, sum(f.chunks)) for f in self.active_request.files]
+                    logger.error(f"[RunAI Streamer][Cache] Read error. Current batch files: {current_files}")
+                    raise
                 if chunk_relative_index is None:
                     return
                 file_path, chunk_index, chunk_buffer = self.requests_iterator.get_global_file_and_chunk(

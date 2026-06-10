@@ -2,7 +2,6 @@ import hashlib
 import json
 import os
 import logging
-import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -49,8 +48,15 @@ class _CacheWriter:
 
     def append(self, data) -> None:
         """Append data to the cache file. Accepts bytes, memoryview, or numpy array."""
-        os.write(self._fd, data)
-        self._written += len(data)
+        mv = memoryview(data).cast('B')
+        total = len(mv)
+        written = 0
+        while written < total:
+            n = os.write(self._fd, mv[written:])
+            if n == 0:
+                raise OSError(f"os.write returned 0, disk may be full")
+            written += n
+        self._written += total
 
     def finalize(self) -> None:
         try:
@@ -62,15 +68,16 @@ class _CacheWriter:
                 self._cleanup()
                 return
             os.rename(self._tmp_path, self._final_path)
-            # Sentinel stores metadata for cache validation
             meta = {"remote_path": self._remote_path, "file_offset": self._file_offset, "size": self._written, "rank": self._rank, "world_size": self._world_size}
             with open(self._sentinel, "w") as f:
                 json.dump(meta, f)
+
             elapsed = time.time() - self._start_time
             throughput = self._written / elapsed / (1024 * 1024) if elapsed > 0 else 0
             logger.info(
                 f"[RunAI Streamer][Cache] Cached: {self._remote_path} "
-                f"({self._written} bytes) in {elapsed:.1f}s ({throughput:.0f} MB/s)"
+                f"({self._written} bytes) in {elapsed:.1f}s ({throughput:.0f} MB/s) "
+                f"[rank={self._rank}, tp={self._world_size}]"
             )
         except OSError as e:
             # Race with another worker — if final file now exists, that's fine
@@ -210,7 +217,6 @@ class StreamCache:
         if not self._writers:
             elapsed = time.time() - self._cache_start_time if self._cache_start_time else 0
             logger.info(f"[RunAI Streamer][Cache] All files cached in {elapsed:.1f}s")
-            self._cache_start_time = None
 
     def abort_all(self) -> None:
         """Clean up incomplete writers on error."""
